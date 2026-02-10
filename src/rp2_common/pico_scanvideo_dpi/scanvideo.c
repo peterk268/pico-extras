@@ -1836,6 +1836,7 @@ void scanvideo_timing_enable(bool enable) {
 
             // Disable PIO state machines and clear FIFOs to leave PIO in a known state
             pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+            busy_wait_us(200);  // let hardware settle
             pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
             pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
     #if PICO_SCANVIDEO_PLANE_COUNT > 1
