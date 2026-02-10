@@ -1795,6 +1795,10 @@ void scanvideo_timing_enable(bool enable) {
 #endif
 
         if (enable) {
+            // Ensure DMA IRQs are enabled when turning timing back on
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+            dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, true);
+#endif
             uint jmp = video_program_load_offset + pio_encode_jmp(video_mode.pio_program->entry_point);
             pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM, jmp);
 #if PICO_SCANVIDEO_PLANE_COUNT > 1
@@ -1807,6 +1811,49 @@ void scanvideo_timing_enable(bool enable) {
             pio_sm_exec(video_pio, PICO_SCANVIDEO_TIMING_SM,
                         pio_encode_jmp(video_htiming_load_offset + video_htiming_offset_entry_point));
             pio_set_sm_mask_enabled(video_pio, sm_mask, true);
+        }
+        else {
+            // Safer disable path to avoid races with IRQ handlers / DMA in flight.
+            // Stop DMA interrupts at controller level first
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+            dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, false);
+#endif
+
+            // Abort any in-flight DMA transfers and clear pending DMA ints
+            dma_hw->abort = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+    #if !PICO_RP2040
+            while (dma_hw->abort & PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK) tight_loop_contents();
+    #else
+            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL)) tight_loop_contents();
+    #if PICO_SCANVIDEO_PLANE_COUNT > 1
+            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL2)) tight_loop_contents();
+    #if PICO_SCANVIDEO_PLANE_COUNT > 2
+            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL3)) tight_loop_contents();
+    #endif
+    #endif
+    #endif
+            dma_hw->ints0 = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+
+            // Disable PIO state machines and clear FIFOs to leave PIO in a known state
+            pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
+    #if PICO_SCANVIDEO_PLANE_COUNT > 1
+            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+    #if PICO_SCANVIDEO_PLANE_COUNT > 2
+            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+    #endif
+    #endif
+
+            // Restart SMs so they're in a clean idle state
+            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+            pio_sm_restart(video_pio, PICO_SCANVIDEO_TIMING_SM);
+    #if PICO_SCANVIDEO_PLANE_COUNT > 1
+            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+    #if PICO_SCANVIDEO_PLANE_COUNT > 2
+            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+    #endif
+    #endif
         }
         video_timing_enabled = enable;
     }
