@@ -1763,99 +1763,247 @@ pio_sm_config video_24mhz_composable_configure_pio(pio_hw_t *pio, uint sm, uint 
     return config;
 }
 
+// This version properly cleans up state and prevents crashes on disable/re-enable
 void scanvideo_timing_enable(bool enable) {
-    // todo we need to protect our state here... this can't be frame synced obviously (at least turning on)
-    // todo but we should make sure we clear out state when we turn it off, and probably reset scanline counter when we turn it on
-    if (enable != video_timing_enabled) {
-        // todo should we disable these too? if not move to scanvideo_setup
-        pio_set_irq0_source_mask_enabled(video_pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), enable);
-        pio_set_irq1_source_enabled(video_pio, pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, enable);
-        irq_set_mask_enabled((1u << PIO0_IRQ_0)
-                              | (1u << PIO0_IRQ_1)
-                              #if !PICO_SCANVIDEO_NO_DMA_TRACKING
-                              | (1u << DMA_IRQ_0)
-#endif
-                , enable);
-        uint32_t sm_mask = (1u << PICO_SCANVIDEO_SCANLINE_SM) | 1u << PICO_SCANVIDEO_TIMING_SM;
+    if (enable == video_timing_enabled) {
+        return; // Already in desired state
+    }
+
+    uint32_t sm_mask = (1u << PICO_SCANVIDEO_SCANLINE_SM) | (1u << PICO_SCANVIDEO_TIMING_SM);
 #if PICO_SCANVIDEO_PLANE_COUNT > 1
-        sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM2;
+    sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM2;
 #if PICO_SCANVIDEO_PLANE_COUNT > 2
-        sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM3;
+    sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM3;
 #endif
 #endif
+
+    if (!enable) {
+        // ========== DISABLING SEQUENCE ==========
+        
+        // Step 1: Disable IRQs at NVIC level first (prevents any new IRQ handlers from running)
+        uint32_t irq_mask = (1u << PIO0_IRQ_0) | (1u << PIO0_IRQ_1);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        irq_mask |= (1u << DMA_IRQ_0);
+#endif
+        irq_set_mask_enabled(irq_mask, false);
+        
+        // Step 2: Disable DMA IRQs at controller level
+        dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, false);
+        
+        // Step 3: Disable PIO IRQ sources
+        pio_set_irq0_source_mask_enabled(video_pio, 
+            (1u << pis_interrupt0) | (1u << pis_interrupt1), false);
+        pio_set_irq1_source_enabled(video_pio, 
+            pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, false);
+        
+        // Step 4: Stop state machines
+        pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+        
+        // Step 5: Abort any in-flight DMA transfers
+        dma_hw->abort = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+#if !PICO_RP2040
+        while (dma_hw->abort & PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK) {
+            tight_loop_contents();
+        }
+#else
+        while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL)) tight_loop_contents();
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+        while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL2)) tight_loop_contents();
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+        while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL3)) tight_loop_contents();
+#endif
+#endif
+#endif
+        
+        // Step 6: Clear any pending DMA interrupts
+        dma_hw->ints0 = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+        
+        // Step 7: Clear PIO FIFOs and restart SMs to known state
+        pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+        pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+        pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+        pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+#endif
+#endif
+        
+        pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+        pio_sm_restart(video_pio, PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+        pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+        pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+#endif
+#endif
+        
+        // Step 8: CRITICAL - Clean up all scanline buffer lists
+        // This prevents crashes on re-enable by ensuring buffers are back in free list
+        
+        // Collect all buffers from various lists
+        full_scanline_buffer_t *buffers_to_free = NULL;
+        
+        // Get buffers from in_use list
+        uint32_t save = spin_lock_blocking(shared_state.in_use.lock);
+        buffers_to_free = shared_state.in_use.in_use_ascending_scanline_id_list;
+        shared_state.in_use.in_use_ascending_scanline_id_list = NULL;
+        shared_state.in_use.in_use_ascending_scanline_id_list_tail = NULL;
+        spin_unlock(shared_state.in_use.lock, save);
+        
+        // Get buffers from generated list
+        save = spin_lock_blocking(shared_state.scanline.lock);
+        full_scanline_buffer_t *generated = shared_state.scanline.generated_ascending_scanline_id_list;
+        shared_state.scanline.generated_ascending_scanline_id_list = NULL;
+        shared_state.scanline.generated_ascending_scanline_id_list_tail = NULL;
+        
+#if PICO_SCANVIDEO_ENABLE_SCANLINE_ASSERTIONS && GENERATING_LIST
+        full_scanline_buffer_t *generating = shared_state.scanline.generating_list;
+        shared_state.scanline.generating_list = NULL;
+#endif
+        
+        // Clear current scanline buffer reference
+        shared_state.scanline.current_scanline_buffer = NULL;
+        spin_unlock(shared_state.scanline.lock, save);
+        
+        // Prepend all collected buffers to the local free list
+        if (generated) {
+            list_prepend_all(&buffers_to_free, generated);
+        }
+        
+#if PICO_SCANVIDEO_ENABLE_SCANLINE_ASSERTIONS && GENERATING_LIST
+        if (generating) {
+            list_prepend_all(&buffers_to_free, generating);
+        }
+#endif
+        
+        // Now return all collected buffers to the free list
+        if (buffers_to_free) {
+            save = spin_lock_blocking(shared_state.free_list.lock);
+            
+            // Walk the list and clear any link pointers
+            full_scanline_buffer_t *fsb = buffers_to_free;
+            while (fsb) {
+                full_scanline_buffer_t *next = fsb->next;
+#if PICO_SCANVIDEO_LINKED_SCANLINE_BUFFERS
+                // Clear any linked buffers
+                if (fsb->core.link) {
+                    fsb->core.link = NULL;
+                }
+                fsb->core.link_after = 0;
+#endif
+                fsb = next;
+            }
+            
+            list_prepend_all(&shared_state.free_list.free_list, buffers_to_free);
+            spin_unlock(shared_state.free_list.lock, save);
+        }
+        
+        // Step 9: Reset all shared state to initial values
+        save = spin_lock_blocking(shared_state.scanline.lock);
+        shared_state.scanline.last_scanline_id = 0xffffffff;
+        shared_state.scanline.next_scanline_id = 0;
+        shared_state.scanline.y_repeat_index = 0;
+        shared_state.scanline.y_repeat_target = 0;
+        shared_state.scanline.in_vblank = false;
+        spin_unlock(shared_state.scanline.lock, save);
+        
+        save = spin_lock_blocking(shared_state.dma.lock);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        shared_state.dma.dma_completion_state = 0;
+#endif
+        shared_state.dma.buffers_to_release = 0;
+        shared_state.dma.scanline_in_progress = false;
+        spin_unlock(shared_state.dma.lock, save);
+        
+        // Step 10: Reset timing state
+        timing_state.timing_scanline = 0;
+        timing_state.dma_state_index = 0;
+        timing_state.vsync_bits = timing_state.vsync_bits_no_pulse;
+        
+        // Step 11: Reset vblank semaphore to known state
+        // Drain any pending releases
+        while (sem_try_acquire(&vblank_begin)) {
+            // Drain
+        }
+        
+        video_timing_enabled = false;
+        
+    } else {
+        // ========== ENABLING SEQUENCE ==========
+        
+        // Verify we're starting from a clean state
+        assert(shared_state.scanline.current_scanline_buffer == NULL);
+        assert(shared_state.scanline.generated_ascending_scanline_id_list == NULL);
+        assert(shared_state.in_use.in_use_ascending_scanline_id_list == NULL);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        assert(shared_state.dma.dma_completion_state == 0);
+#endif
+        assert(shared_state.dma.buffers_to_release == 0);
+        assert(!shared_state.dma.scanline_in_progress);
+        
+        // Ensure DMA interrupts are configured
+        dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, true);
+        
+        // Set up timing for first frame
+        setup_dma_states_vblank();
+        timing_state.vsync_bits = timing_state.vsync_bits_no_pulse;
+        timing_state.timing_scanline = 0;
+        timing_state.dma_state_index = 0;
+        
+        // Initialize scanline tracking for first frame
+        uint32_t save = spin_lock_blocking(shared_state.scanline.lock);
+        shared_state.scanline.next_scanline_id = 0;
+        shared_state.scanline.last_scanline_id = 0xffffffff;
+        shared_state.scanline.y_repeat_index = 0;
+        set_next_scanline_id(0); // This sets y_repeat_target
+        shared_state.scanline.in_vblank = true; // Start in vblank
+        spin_unlock(shared_state.scanline.lock, save);
+        
+        // Clear any stale PIO IRQ flags
+        video_pio->irq = 0x3; // Clear IRQ0 and IRQ1
+        
+        // Set SMs to entry points
+        uint jmp = video_program_load_offset + pio_encode_jmp(video_mode.pio_program->entry_point);
+        pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM, jmp);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+        pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM2, jmp);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+        pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM3, jmp);
+#endif
+#endif
+        
+        pio_sm_exec(video_pio, PICO_SCANVIDEO_TIMING_SM,
+                    pio_encode_jmp(video_htiming_load_offset + video_htiming_offset_entry_point));
+        
+        // Enable PIO IRQ sources
+        pio_set_irq0_source_mask_enabled(video_pio, 
+            (1u << pis_interrupt0) | (1u << pis_interrupt1), true);
+        pio_set_irq1_source_enabled(video_pio, 
+            pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, true);
+        
+        // Enable NVIC IRQs
+        uint32_t irq_mask = (1u << PIO0_IRQ_0) | (1u << PIO0_IRQ_1);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        irq_mask |= (1u << DMA_IRQ_0);
+#endif
+        irq_set_mask_enabled(irq_mask, true);
+        
+        // Claim SMs if not already claimed
         static bool sms_claimed = false;
         if (!sms_claimed) {
             pio_claim_sm_mask(video_pio, sm_mask);
             sms_claimed = true;
         }
-
-        pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+        
+        // Restart clock dividers if needed
 #if PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN
         pio_clkdiv_restart_sm_mask(video_pio, sm_mask);
 #endif
-
-        if (enable) {
-            // Ensure DMA IRQs are enabled when turning timing back on
-#if !PICO_SCANVIDEO_NO_DMA_TRACKING
-            dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, true);
-#endif
-            uint jmp = video_program_load_offset + pio_encode_jmp(video_mode.pio_program->entry_point);
-            pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM, jmp);
-#if PICO_SCANVIDEO_PLANE_COUNT > 1
-            pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM2, jmp);
-#if PICO_SCANVIDEO_PLANE_COUNT > 2
-            pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM3, jmp);
-#endif
-#endif
-            // todo we should offset the addresses for the SM
-            pio_sm_exec(video_pio, PICO_SCANVIDEO_TIMING_SM,
-                        pio_encode_jmp(video_htiming_load_offset + video_htiming_offset_entry_point));
-            pio_set_sm_mask_enabled(video_pio, sm_mask, true);
-        }
-        else {
-            // Safer disable path to avoid races with IRQ handlers / DMA in flight.
-            // Stop DMA interrupts at controller level first
-#if !PICO_SCANVIDEO_NO_DMA_TRACKING
-            dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, false);
-#endif
-
-            // Abort any in-flight DMA transfers and clear pending DMA ints
-            dma_hw->abort = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
-    #if !PICO_RP2040
-            while (dma_hw->abort & PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK) tight_loop_contents();
-    #else
-            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL)) tight_loop_contents();
-    #if PICO_SCANVIDEO_PLANE_COUNT > 1
-            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL2)) tight_loop_contents();
-    #if PICO_SCANVIDEO_PLANE_COUNT > 2
-            while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL3)) tight_loop_contents();
-    #endif
-    #endif
-    #endif
-            dma_hw->ints0 = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
-
-            // Disable PIO state machines and clear FIFOs to leave PIO in a known state
-            pio_set_sm_mask_enabled(video_pio, sm_mask, false);
-            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
-            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
-    #if PICO_SCANVIDEO_PLANE_COUNT > 1
-            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
-    #if PICO_SCANVIDEO_PLANE_COUNT > 2
-            pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
-    #endif
-    #endif
-
-            // Restart SMs so they're in a clean idle state
-            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
-            pio_sm_restart(video_pio, PICO_SCANVIDEO_TIMING_SM);
-    #if PICO_SCANVIDEO_PLANE_COUNT > 1
-            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
-    #if PICO_SCANVIDEO_PLANE_COUNT > 2
-            pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
-    #endif
-    #endif
-        }
-        video_timing_enabled = enable;
+        
+        // Start state machines
+        pio_set_sm_mask_enabled(video_pio, sm_mask, true);
+        
+        video_timing_enabled = true;
     }
 }
 
