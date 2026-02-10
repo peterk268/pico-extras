@@ -204,12 +204,13 @@ static struct {
     uint32_t vsync_bits_no_pulse;
 
     uint32_t a, a_vblank, b1, b2, c, c_vblank;
+    uint32_t d, d_vblank; // NEW: front-porch slot with DEN low
     uint32_t vsync_bits;
     uint16_t dma_state_index;
     int32_t timing_scanline;
 } timing_state;
 
-#define DMA_STATE_COUNT 4
+#define DMA_STATE_COUNT 5
 static uint32_t dma_states[DMA_STATE_COUNT];
 
 // todo get rid of this altogether
@@ -917,8 +918,23 @@ static void __video_time_critical_func(prepare_for_vblank_scanline_irqs_enabled)
     }
 }
 
-#define setup_dma_states_vblank() if (true) { dma_states[0] = timing_state.a_vblank; dma_states[1] = timing_state.b1; dma_states[2] = timing_state.b2; dma_states[3] = timing_state.c_vblank; } else __builtin_unreachable()
-#define setup_dma_states_no_vblank() if (true) { dma_states[0] = timing_state.a; dma_states[1] = timing_state.b1; dma_states[2] = timing_state.b2; dma_states[3] = timing_state.c; } else __builtin_unreachable()
+#define setup_dma_states_vblank() \
+    if (true) { \
+        dma_states[0] = timing_state.a_vblank; \
+        dma_states[1] = timing_state.b1; \
+        dma_states[2] = timing_state.b2; \
+        dma_states[3] = timing_state.c_vblank; /* active=0, DEN=0 */ \
+        dma_states[4] = timing_state.d_vblank; /* front porch, DEN=0 */ \
+    } else __builtin_unreachable()
+
+#define setup_dma_states_no_vblank() \
+    if (true) { \
+        dma_states[0] = timing_state.a; \
+        dma_states[1] = timing_state.b1; \
+        dma_states[2] = timing_state.b2; \
+        dma_states[3] = timing_state.c;       /* active, DEN=1 */ \
+        dma_states[4] = timing_state.d;       /* front porch, DEN=0 */ \
+    } else __builtin_unreachable()
 
 static inline void top_up_timing_pio_fifo() {
     // todo better irq reset ... we are seeing irq get set again, handled in this loop, then we re-enter here when we don't need to
@@ -1045,15 +1061,17 @@ void setup_sm(int sm, uint offset) {
         pin_count = 2;
 #endif
         sm_config_set_out_pins(&config, BASE, pin_count);
-#if PICO_SCANVIDEO_ENABLE_DEN_PIN
+#if PICO_SCANVIDEO_ENABLE_CLOCK_PIN
         // side set pin as well
         sm_config_set_sideset_pins(&config, BASE + pin_count);
         pin_count++;
 #endif
-        pio_sm_set_consecutive_pindirs(video_pio, sm, BASE, pin_count, true);
+        int status = pio_sm_set_consecutive_pindirs(video_pio, sm, BASE, pin_count, true);
+        printf("\nSTATUS %d\n", status);
     }
 
-    pio_sm_init(video_pio, sm, offset, &config); // now paused
+    int status = pio_sm_init(video_pio, sm, offset, &config); // now paused
+    printf("\nSTATUS %d\n", status);
 }
 
 scanvideo_mode_t scanvideo_get_mode() {
@@ -1362,34 +1380,54 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
     // shared state init complete - probably overkill
     __mem_fence_release();
 
-    uint pin_mask = 3u << PICO_SCANVIDEO_SYNC_PIN_BASE;
-    bi_decl_if_func_used(bi_2pins_with_names(PICO_SCANVIDEO_SYNC_PIN_BASE, "HSync",
-                                               PICO_SCANVIDEO_SYNC_PIN_BASE + 1, "VSync"));
+    uint64_t pin_mask = 3ull << PICO_SCANVIDEO_SYNC_PIN_BASE;
 
-#if PICO_SCANVIDEO_ENABLE_DEN_PIN
+    bi_decl_if_func_used(bi_2pins_with_names(
+        PICO_SCANVIDEO_SYNC_PIN_BASE, "HSync",
+        PICO_SCANVIDEO_SYNC_PIN_BASE + 1, "VSync"));
+
+    #if PICO_SCANVIDEO_ENABLE_DEN_PIN
     bi_decl_if_func_used(bi_1pin_with_name(PICO_SCANVIDEO_SYNC_PIN_BASE + 2, "Display Enable"));
-    pin_mask |= 4u << PICO_SCANVIDEO_SYNC_PIN_BASE;
-#endif
-#if PICO_SCANVIDEO_ENABLE_CLOCK_PIN
+    pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+    #endif
+
+    #if PICO_SCANVIDEO_ENABLE_CLOCK_PIN && PICO_SCANVIDEO_ENABLE_DEN_PIN
     bi_decl_if_func_used(bi_1pin_with_name(PICO_SCANVIDEO_SYNC_PIN_BASE + 3, "Pixel Clock"));
-    pin_mask |= 8u << PICO_SCANVIDEO_SYNC_PIN_BASE;
-#endif
+    pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 3);
+    #elif PICO_SCANVIDEO_ENABLE_CLOCK_PIN
+    bi_decl_if_func_used(bi_1pin_with_name(PICO_SCANVIDEO_SYNC_PIN_BASE + 2, "Pixel Clock"));
+    pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+    #endif
+
     static_assert(PICO_SCANVIDEO_PIXEL_RSHIFT + PICO_SCANVIDEO_PIXEL_RCOUNT <= PICO_SCANVIDEO_COLOR_PIN_COUNT, "red bits do not fit in color pins");
     static_assert(PICO_SCANVIDEO_PIXEL_GSHIFT + PICO_SCANVIDEO_PIXEL_GCOUNT <= PICO_SCANVIDEO_COLOR_PIN_COUNT, "green bits do not fit in color pins");
     static_assert(PICO_SCANVIDEO_PIXEL_BSHIFT + PICO_SCANVIDEO_PIXEL_BCOUNT <= PICO_SCANVIDEO_COLOR_PIN_COUNT, "blue bits do not fit in color pins");
-#define RMASK ((1u << PICO_SCANVIDEO_PIXEL_RCOUNT) - 1u)
-#define GMASK ((1u << PICO_SCANVIDEO_PIXEL_GCOUNT) - 1u)
-#define BMASK ((1u << PICO_SCANVIDEO_PIXEL_BCOUNT) - 1u)
-    pin_mask |= RMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_RSHIFT);
-    pin_mask |= GMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_GSHIFT);
-    pin_mask |= BMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_BSHIFT);
-    bi_decl_if_func_used(bi_pin_mask_with_name(RMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_RSHIFT), RMASK == 1 ? "Red" : ("Red 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_GCOUNT))));
-    bi_decl_if_func_used(bi_pin_mask_with_name(GMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_GSHIFT), GMASK == 1 ? "Green" : ("Green 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_GCOUNT))));
-    bi_decl_if_func_used(bi_pin_mask_with_name(BMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_BSHIFT), BMASK == 1 ? "Blue" : ("Blue 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_BCOUNT))));
 
-    for(uint8_t i = 0; pin_mask; i++, pin_mask>>=1u) {
-        if (pin_mask & 1) gpio_set_function(i, GPIO_FUNC_PIO0);
+    #define RMASK ((1u << PICO_SCANVIDEO_PIXEL_RCOUNT) - 1u)
+    #define GMASK ((1u << PICO_SCANVIDEO_PIXEL_GCOUNT) - 1u)
+    #define BMASK ((1u << PICO_SCANVIDEO_PIXEL_BCOUNT) - 1u)
+
+    pin_mask |= (uint64_t)RMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_RSHIFT);
+    pin_mask |= (uint64_t)GMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_GSHIFT);
+    pin_mask |= (uint64_t)BMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_BSHIFT);
+
+    bi_decl_if_func_used(bi_pin_mask_with_name(
+        (uint64_t)RMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_RSHIFT),
+        RMASK == 1 ? "Red" : ("Red 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_RCOUNT))));
+    bi_decl_if_func_used(bi_pin_mask_with_name(
+        (uint64_t)GMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_GSHIFT),
+        GMASK == 1 ? "Green" : ("Green 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_GCOUNT))));
+    bi_decl_if_func_used(bi_pin_mask_with_name(
+        (uint64_t)BMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_BSHIFT),
+        BMASK == 1 ? "Blue" : ("Blue 0-" __XSTRING(PICO_SCANVIDEO_PIXEL_BCOUNT))));
+
+    // ✅ Iterate over all GPIOs 0–47 and apply PIO0 function only to pins in the mask
+    for (uint8_t gpio = 0; gpio <= 47; gpio++) {
+        if (pin_mask & (1ull << gpio)) {
+            gpio_set_function(gpio, GPIO_FUNC_PIO0);
+        }
     }
+    pio_set_gpio_base(video_pio, 16);
 
 #if !PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN
     valid_params_if(SCANVIDEO_DPI, timing->clock_freq == video_clock_freq);
@@ -1610,28 +1648,34 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
 #define C_CMD SET_IRQ_SCANLINE
 #define C_CMD_VBLANK CLEAR_IRQ_SCANLINE
 
+    // --- existing code before this computes h_back_porch etc. ---
     int h_sync_bit = timing->h_sync_polarity ? 0 : 1;
-    timing_state.a = timing_encode(A_CMD, 4, h_sync_bit);
-    static_assert(HTIMING_MIN >= 4, "");
-    timing_state.a_vblank = timing_encode(A_CMD_VBLANK, 4, h_sync_bit);
-    int h_back_porch = timing->h_total - timing->h_front_porch - timing->h_pulse - timing->h_active;
 
+    // A: small preamble (unchanged)
+    timing_state.a       = timing_encode(A_CMD,            4,                          h_sync_bit);
+    timing_state.a_vblank= timing_encode(A_CMD_VBLANK,     4,                          h_sync_bit);
+
+    // B1: HSYNC pulse (unchanged)
     valid_params_if(SCANVIDEO_DPI, timing->h_pulse - 4 >= HTIMING_MIN);
-    timing_state.b1 = timing_encode(B1_CMD, timing->h_pulse - 4, h_sync_bit);
+    timing_state.b1      = timing_encode(B1_CMD,           timing->h_pulse - 4,        h_sync_bit);
 
-    // todo decide on what these should be - we should really be asserting the timings
-    //
-    // todo note that the placement of the active scanline IRQ from the timing program is super important.
-    //  if it gets moved too much (or indeed at all) it may be that there are problems with DMA/SM IRQ
-    //  overlap, which may require the addition of a separate timing state for the prepare for scanline
-    //  (separate from the needs of setting the hsync pulse)
-    valid_params_if(SCANVIDEO_DPI, timing->h_active >= HTIMING_MIN);
-    //assert(timing->h_front_porch >= HTIMING_MIN);
+    // B2: back porch (unchanged)
+    int h_back_porch = timing->h_total - timing->h_front_porch - timing->h_pulse - timing->h_active;
     valid_params_if(SCANVIDEO_DPI, h_back_porch >= HTIMING_MIN);
-    valid_params_if(SCANVIDEO_DPI, (timing->h_total - h_back_porch - timing->h_pulse) >= HTIMING_MIN);
-    timing_state.b2 = timing_encode(B2_CMD, h_back_porch, !h_sync_bit);
-    timing_state.c = timing_encode(C_CMD, timing->h_total - h_back_porch - timing->h_pulse, 4 | !h_sync_bit);
-    timing_state.c_vblank = timing_encode(C_CMD_VBLANK, timing->h_total - h_back_porch - timing->h_pulse, !h_sync_bit);
+    timing_state.b2      = timing_encode(B2_CMD,           h_back_porch,               !h_sync_bit);
+
+    // C: ACTIVE ONLY (DEN=1 here)
+    valid_params_if(SCANVIDEO_DPI, timing->h_active >= HTIMING_MIN);
+    timing_state.c       = timing_encode(C_CMD,            timing->h_active,           (4 /*DEN*/ | !h_sync_bit));
+
+    // D: FRONT PORCH (DEN=0 here) — NEW
+    valid_params_if(SCANVIDEO_DPI, timing->h_front_porch >= HTIMING_MIN);
+    timing_state.d       = timing_encode(C_CMD,            timing->h_front_porch,      (!h_sync_bit));
+
+    // VBLANK variants: DEN must be low throughout
+    // (Active=0 lines; we still provide the structure so the SM timing stays consistent)
+    timing_state.c_vblank= timing_encode(C_CMD_VBLANK,     timing->h_active,           (!h_sync_bit));
+    timing_state.d_vblank= timing_encode(C_CMD_VBLANK,     timing->h_front_porch,      (!h_sync_bit));
 
     // this is two scanlines in vblank
     setup_dma_states_vblank();
@@ -1724,8 +1768,8 @@ void scanvideo_timing_enable(bool enable) {
     // todo but we should make sure we clear out state when we turn it off, and probably reset scanline counter when we turn it on
     if (enable != video_timing_enabled) {
         // todo should we disable these too? if not move to scanvideo_setup
-        pio_set_irq0_source_mask_enabled(video_pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), true);
-        pio_set_irq1_source_enabled(video_pio, pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, true);
+        pio_set_irq0_source_mask_enabled(video_pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), enable);
+        pio_set_irq1_source_enabled(video_pio, pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, enable);
         irq_set_mask_enabled((1u << PIO0_IRQ_0)
                               | (1u << PIO0_IRQ_1)
                               #if !PICO_SCANVIDEO_NO_DMA_TRACKING
@@ -1739,7 +1783,12 @@ void scanvideo_timing_enable(bool enable) {
         sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM3;
 #endif
 #endif
-        pio_claim_sm_mask(video_pio, sm_mask);
+        static bool sms_claimed = false;
+        if (!sms_claimed) {
+            pio_claim_sm_mask(video_pio, sm_mask);
+            sms_claimed = true;
+        }
+
         pio_set_sm_mask_enabled(video_pio, sm_mask, false);
 #if PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN
         pio_clkdiv_restart_sm_mask(video_pio, sm_mask);
@@ -1764,17 +1813,23 @@ void scanvideo_timing_enable(bool enable) {
 }
 
 uint32_t scanvideo_wait_for_scanline_complete(uint32_t scanline_id) {
-    // next_scanline_id is potentially the scanline_id in progress, so we need next_scanline_id to
-    // be more than the scanline_id after the passed one
     scanline_id = scanline_id_after(scanline_id);
     uint32_t frame = scanvideo_frame_number(scanline_id);
+
+    // If timing is disabled, we cannot make forward progress via WFE/IRQs.
+    // Treat as complete and return the current next_scanline_id snapshot.
+    if (!video_timing_enabled) {
+        return scanvideo_get_next_scanline_id();
+    }
+
     uint32_t next_scanline_id;
-    // scanline_id > scanvideo_get_next_scanline_id() but with wrapping support
     while (0 < (scanline_id - (next_scanline_id = scanvideo_get_next_scanline_id()))) {
-        // we may end up waiting for the next scanline while in vblank; the one we are waiting for is clearly done
-        if (scanvideo_in_vblank() && (scanvideo_frame_number(next_scanline_id) - frame) >= 1)
-            break;
-        assert(video_timing_enabled); // todo should we just return
+        if (scanvideo_in_vblank() && (scanvideo_frame_number(next_scanline_id) - frame) >= 1) break;
+
+        // If timing gets disabled mid-wait, bail safely.
+        if (!video_timing_enabled) {
+            return next_scanline_id;
+        }
         __wfe();
     }
     return next_scanline_id;
@@ -1868,5 +1923,137 @@ void validate_scanline(const uint32_t *dma_data, uint dma_data_size,
     assert(had_black);
 }
 #endif
+
+// Not a good idea in my opinion, just keeping around for reference.
+void scanvideo_shutdown(bool restore_gpio) {
+    // ---- App responsibility: ensure no one is generating scanlines now ----
+    // e.g. stop the generator core/task before calling this.
+
+    // 1) Stop timing/IRQs/SMs via the existing API
+    scanvideo_timing_enable(false);
+
+    // 2) Hard-disable PIO IRQ sources (in case code changes later)
+    pio_set_irq0_source_mask_enabled(video_pio,
+        (1u << pis_interrupt0) | (1u << pis_interrupt1), false);
+    pio_set_irq1_source_enabled(video_pio,
+        pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, false);
+
+    // Disable NVIC IRQs used by scanvideo
+    irq_set_enabled(PIO0_IRQ_0, false);
+    irq_set_enabled(PIO0_IRQ_1, false);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+    irq_set_enabled(DMA_IRQ_0, false);
+#endif
+
+    // 3) Stop DMA + clear any pending DMA IRQ flags
+    dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, false);
+
+    // Abort channels (your code has abort_all_dma_channels_assuming_no_irq_preemption())
+    // Here we do a safer generic abort.
+    dma_hw->abort = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+#if !PICO_RP2040
+    while (dma_hw->abort & PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK) tight_loop_contents();
+#else
+    while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL)) tight_loop_contents();
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL2)) tight_loop_contents();
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    while (dma_channel_is_busy(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL3)) tight_loop_contents();
+#endif
+#endif
+#endif
+    // Clear pending ints
+    dma_hw->ints0 = PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK;
+
+    // 4) Disable and reset the PIO state machines we used
+    uint32_t sm_mask = (1u << PICO_SCANVIDEO_SCANLINE_SM) | (1u << PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM2;
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM3;
+#endif
+#endif
+
+    pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+
+    // Clear FIFOs (scanline + timing)
+    pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+    pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+#endif
+#endif
+
+    // Optional: restart SMs so they’re in a known idle state
+    pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+    pio_sm_restart(video_pio, PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+#endif
+#endif
+
+    // 5) Optional: unclaim DMA channels (if you want to reuse them elsewhere)
+    dma_channel_unclaim(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    dma_channel_unclaim(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    dma_channel_unclaim(PICO_SCANVIDEO_SCANLINE_DMA_CHANNEL3);
+#endif
+#endif
+#if PICO_SCANVIDEO_PLANE1_FRAGMENT_DMA
+    dma_channel_unclaim(PICO_SCANVIDEO_SCANLINE_DMA_CB_CHANNEL);
+#endif
+#if PICO_SCANVIDEO_PLANE2_FRAGMENT_DMA
+    dma_channel_unclaim(PICO_SCANVIDEO_SCANLINE_DMA_CB_CHANNEL2);
+#endif
+
+    // 6) Optional: unclaim SMs (if you plan to use them for something else)
+    pio_sm_unclaim(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
+    pio_sm_unclaim(video_pio, PICO_SCANVIDEO_TIMING_SM);
+#if PICO_SCANVIDEO_PLANE_COUNT > 1
+    pio_sm_unclaim(video_pio, PICO_SCANVIDEO_SCANLINE_SM2);
+#if PICO_SCANVIDEO_PLANE_COUNT > 2
+    pio_sm_unclaim(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
+#endif
+#endif
+
+    // 7) Optional: remove the loaded PIO programs (only if you truly want to reclaim IMEM)
+    // NOTE: This only works if nothing else is using those program slots.
+    // pio_remove_program(video_pio, &video_htiming_program, video_htiming_load_offset);
+    // pio_remove_program(video_pio, video_mode.pio_program->program, video_program_load_offset);
+
+    // 8) Optional: restore GPIOs away from PIO
+    if (restore_gpio) {
+        uint64_t pin_mask = 3ull << PICO_SCANVIDEO_SYNC_PIN_BASE;
+#if PICO_SCANVIDEO_ENABLE_DEN_PIN
+        pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+#endif
+#if PICO_SCANVIDEO_ENABLE_CLOCK_PIN && PICO_SCANVIDEO_ENABLE_DEN_PIN
+        pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 3);
+#elif PICO_SCANVIDEO_ENABLE_CLOCK_PIN
+        pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+#endif
+        // color pins
+        #define RMASK ((1u << PICO_SCANVIDEO_PIXEL_RCOUNT) - 1u)
+        #define GMASK ((1u << PICO_SCANVIDEO_PIXEL_GCOUNT) - 1u)
+        #define BMASK ((1u << PICO_SCANVIDEO_PIXEL_BCOUNT) - 1u)
+        pin_mask |= (uint64_t)RMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_RSHIFT);
+        pin_mask |= (uint64_t)GMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_GSHIFT);
+        pin_mask |= (uint64_t)BMASK << (PICO_SCANVIDEO_COLOR_PIN_BASE + PICO_SCANVIDEO_PIXEL_BSHIFT);
+
+        for (uint8_t gpio = 0; gpio <= 47; gpio++) {
+            if (pin_mask & (1ull << gpio)) {
+                gpio_set_function(gpio, GPIO_FUNC_SIO);
+                gpio_set_dir(gpio, GPIO_IN); // high-Z
+                gpio_disable_pulls(gpio);
+            }
+        }
+    }
+}
+
 
 GCC_Pragma("GCC pop_options")
