@@ -1763,10 +1763,23 @@ pio_sm_config video_24mhz_composable_configure_pio(pio_hw_t *pio, uint sm, uint 
     return config;
 }
 
+static inline void sv_barrier(void) {
+    // Acts like the “printf made it stable” effect:
+    // - memory fence so core0/core1 see state consistently
+    // - SEV to wake any WFE waiters promptly
+    __mem_fence_release();
+    __mem_fence_acquire();
+    __sev();
+}
+
 void scanvideo_timing_enable(bool enable) {
     // todo we need to protect our state here... this can't be frame synced obviously (at least turning on)
     // todo but we should make sure we clear out state when we turn it off, and probably reset scanline counter when we turn it on
     if (enable != video_timing_enabled) {
+        // IMPORTANT: stop anything new from running as early as possible
+        // (this is what prints often “accidentally” accomplish via timing + barriers)
+        sv_barrier();
+
         // todo should we disable these too? if not move to scanvideo_setup
         pio_set_irq0_source_mask_enabled(video_pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), enable);
         pio_set_irq1_source_enabled(video_pio, pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, enable);
@@ -1776,6 +1789,7 @@ void scanvideo_timing_enable(bool enable) {
                               | (1u << DMA_IRQ_0)
 #endif
                 , enable);
+
         uint32_t sm_mask = (1u << PICO_SCANVIDEO_SCANLINE_SM) | 1u << PICO_SCANVIDEO_TIMING_SM;
 #if PICO_SCANVIDEO_PLANE_COUNT > 1
         sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM2;
@@ -1783,22 +1797,31 @@ void scanvideo_timing_enable(bool enable) {
         sm_mask |= 1u << PICO_SCANVIDEO_SCANLINE_SM3;
 #endif
 #endif
+
         static bool sms_claimed = false;
         if (!sms_claimed) {
             pio_claim_sm_mask(video_pio, sm_mask);
             sms_claimed = true;
         }
 
+        // Put SMs into a known disabled state first (common entry point)
         pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+
 #if PICO_SCANVIDEO_ENABLE_VIDEO_CLOCK_DOWN
         pio_clkdiv_restart_sm_mask(video_pio, sm_mask);
 #endif
 
         if (enable) {
+            // Small, deterministic “print-like” spacing (helps race/timing windows)
+            sv_barrier();
+            busy_wait_us(50);   // small, deterministic “print-like” spacing
+
             // Ensure DMA IRQs are enabled when turning timing back on
 #if !PICO_SCANVIDEO_NO_DMA_TRACKING
             dma_set_irq0_channel_mask_enabled(PICO_SCANVIDEO_SCANLINE_DMA_CHANNELS_MASK, true);
 #endif
+
+            // Reset PIO SM instruction pointers to program entry
             uint jmp = video_program_load_offset + pio_encode_jmp(video_mode.pio_program->entry_point);
             pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM, jmp);
 #if PICO_SCANVIDEO_PLANE_COUNT > 1
@@ -1807,12 +1830,25 @@ void scanvideo_timing_enable(bool enable) {
             pio_sm_exec(video_pio, PICO_SCANVIDEO_SCANLINE_SM3, jmp);
 #endif
 #endif
+
             // todo we should offset the addresses for the SM
             pio_sm_exec(video_pio, PICO_SCANVIDEO_TIMING_SM,
                         pio_encode_jmp(video_htiming_load_offset + video_htiming_offset_entry_point));
+
+            // Another tiny settle before turning SMs loose
+            sv_barrier();
+            busy_wait_us(50);
+
+            // Enable SMs
             pio_set_sm_mask_enabled(video_pio, sm_mask, true);
+
+            sv_barrier();
         }
         else {
+            // Small, deterministic “print-like” spacing (helps race/timing windows)
+            sv_barrier();
+            busy_wait_us(50);
+
             // Safer disable path to avoid races with IRQ handlers / DMA in flight.
             // Stop DMA interrupts at controller level first
 #if !PICO_SCANVIDEO_NO_DMA_TRACKING
@@ -1836,7 +1872,11 @@ void scanvideo_timing_enable(bool enable) {
 
             // Disable PIO state machines and clear FIFOs to leave PIO in a known state
             pio_set_sm_mask_enabled(video_pio, sm_mask, false);
+
+            // Optional short settle after disabling SMs
+            sv_barrier();
             busy_wait_us(200);  // let hardware settle
+
             pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_SCANLINE_SM);
             pio_sm_clear_fifos(video_pio, PICO_SCANVIDEO_TIMING_SM);
     #if PICO_SCANVIDEO_PLANE_COUNT > 1
@@ -1855,8 +1895,14 @@ void scanvideo_timing_enable(bool enable) {
             pio_sm_restart(video_pio, PICO_SCANVIDEO_SCANLINE_SM3);
     #endif
     #endif
+
+            // Final barrier to ensure all state is visible and any waiters wake
+            sv_barrier();
         }
+
+        // Publish new state last (so other code can safely key off it)
         video_timing_enabled = enable;
+        sv_barrier();
     }
 }
 
