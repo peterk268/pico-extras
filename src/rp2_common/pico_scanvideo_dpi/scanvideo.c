@@ -342,7 +342,19 @@ static void setup_sm(int sm, uint offset);
 // -- MISC stuff
 static scanvideo_mode_t video_mode;
 static bool video_timing_enabled = false;
-static bool display_enabled = true;
+// When false, the timing SM keeps emitting HSYNC/VSYNC/DOTCLK (so a DE-mode panel
+// with its own GRAM stays synced and holds the last frame) but DE is held low and
+// the per-scanline pixel DMA is skipped. Toggled via scanvideo_set_display_enable().
+// volatile because it is written from either core and read inside the timing ISR.
+static volatile bool display_enabled = true;
+
+// Latched copy of display_enabled, updated only at a frame boundary (when the active
+// region's timing states are (re)built in top_up_timing_pio_fifo). The active-scanline
+// IRQ gate reads THIS, not display_enabled directly, so the per-line pixel-DMA gate and
+// the DEN/IRQ4 state for the active region always flip together at the same frame
+// boundary. Keying both off the raw flag would let them disagree for the remainder of
+// the current frame, latching a band of stale pixels into GRAM with DE still high.
+static volatile bool active_scanlines_enabled = true;
 
 static scanvideo_scanline_repeat_count_fn _scanline_repeat_count_fn;
 #if PICO_SCANVIDEO_SCANLINE_RELEASE_FUNCTION
@@ -932,7 +944,13 @@ static void __video_time_critical_func(prepare_for_vblank_scanline_irqs_enabled)
         dma_states[0] = timing_state.a; \
         dma_states[1] = timing_state.b1; \
         dma_states[2] = timing_state.b2; \
-        dma_states[3] = timing_state.c;       /* active, DEN=1 */ \
+        /* Latch the freeze state once per frame so the DEN/IRQ4 choice below and the */ \
+        /* core0 pixel-DMA gate (which reads active_scanlines_enabled) flip together. */ \
+        active_scanlines_enabled = display_enabled; \
+        /* When the display is "frozen" we keep emitting HSYNC/VSYNC/DOTCLK but use the */ \
+        /* vblank-style active state: DEN stays low (panel ignores the bus and holds GRAM) */ \
+        /* and IRQ4 is NOT set, so the pixel SM is never triggered and cannot underrun. */ \
+        dma_states[3] = active_scanlines_enabled ? timing_state.c : timing_state.c_vblank; /* active, DEN=1/0 */ \
         dma_states[4] = timing_state.d;       /* front porch, DEN=0 */ \
     } else __builtin_unreachable()
 
@@ -981,7 +999,9 @@ void __isr __video_most_time_critical_func(isr_pio0_0)() {
     if (video_pio->irq & 1u) {
         video_pio->irq = 1;
         DEBUG_PINS_SET(video_irq, 1);
-        if (display_enabled) {
+        // active_scanlines_enabled (not display_enabled) so this gate flips in lockstep
+        // with the DEN/IRQ4 active-region state, at a frame boundary. See its declaration.
+        if (active_scanlines_enabled) {
             prepare_for_active_scanline_irqs_enabled();
         }
         DEBUG_PINS_CLR(video_irq, 1);
@@ -1770,6 +1790,35 @@ static inline void sv_barrier(void) {
     __mem_fence_release();
     __mem_fence_acquire();
     __sev();
+}
+
+// Freeze/unfreeze pixel output without tearing down the timing generator.
+//
+// enable == false ("freeze"):
+//   - the timing SM keeps running, so HSYNC/VSYNC/DOTCLK stay valid and a DE-mode
+//     panel with internal GRAM stays locked and keeps displaying the last frame;
+//   - DE (display enable) is forced low for active lines, so the panel ignores the
+//     RGB bus and never writes garbage into GRAM;
+//   - the per-scanline pixel DMA / SM trigger is skipped, freeing core0 IRQ load,
+//     DMA, and bus bandwidth (e.g. for UI work on core1).
+//
+// The new state takes effect at the start of the next frame (next time the active
+// region is set up), i.e. within one frame period.
+//
+// IMPORTANT ordering for the caller:
+//   - before freezing: stop generating scanlines (scanvideo_begin/end_scanline_generation),
+//     otherwise the generated list fills, the free list drains, and the generator blocks.
+//   - before unfreezing: resume generating scanlines first, THEN call with enable=true,
+//     so the first active frame already has pixel data (avoids a flash of missing-scanline color).
+void scanvideo_set_display_enable(bool enable) {
+    display_enabled = enable;
+    // make the change visible to the timing ISR (which may run on the other core)
+    __mem_fence_release();
+    __sev();
+}
+
+bool scanvideo_is_display_enabled(void) {
+    return *(volatile bool *) &display_enabled;
 }
 
 void scanvideo_timing_enable(bool enable) {
