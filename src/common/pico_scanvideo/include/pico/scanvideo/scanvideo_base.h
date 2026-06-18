@@ -167,6 +167,12 @@ typedef struct scanvideo_mode {
 extern bool scanvideo_setup(const scanvideo_mode_t *mode);
 extern bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_timing_t *timing);
 extern void scanvideo_timing_enable(bool enable);
+// Freeze/unfreeze pixel output without tearing down the timing generator.
+// While disabled, HSYNC/VSYNC/DOTCLK keep running but DE is held low and the
+// pixel DMA is skipped, so a DE-mode panel with GRAM holds the last frame and
+// core0/DMA/bus are freed (e.g. for core1 UI). Requires PICO_SCANVIDEO_ENABLE_DEN_PIN.
+extern void scanvideo_set_display_enable(bool enable);
+extern bool scanvideo_is_display_enabled(void);
 // these take effect after the next vsync
 extern void scanvideo_display_enable(bool enable);
 // doesn't exist yet!
