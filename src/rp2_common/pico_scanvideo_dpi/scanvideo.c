@@ -1821,6 +1821,24 @@ bool scanvideo_is_display_enabled(void) {
     return *(volatile bool *) &display_enabled;
 }
 
+static bool scanvideo_nvic_managed_by_timing = true;
+
+void scanvideo_feed_irq_enable(bool enable) {
+    scanvideo_nvic_managed_by_timing = false;   // app owns NVIC from now on
+    if (enable) {
+        irq_set_priority(PIO0_IRQ_0, 0);
+        irq_set_priority(PIO0_IRQ_1, 0x40);
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        irq_set_priority(DMA_IRQ_0, 0x40);
+#endif
+    }
+    irq_set_mask_enabled((1u << PIO0_IRQ_0) | (1u << PIO0_IRQ_1)
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+        | (1u << DMA_IRQ_0)
+#endif
+        , enable);
+}
+
 void scanvideo_timing_enable(bool enable) {
     // todo we need to protect our state here... this can't be frame synced obviously (at least turning on)
     // todo but we should make sure we clear out state when we turn it off, and probably reset scanline counter when we turn it on
@@ -1832,12 +1850,14 @@ void scanvideo_timing_enable(bool enable) {
         // todo should we disable these too? if not move to scanvideo_setup
         pio_set_irq0_source_mask_enabled(video_pio, (1u << pis_interrupt0) | (1u << pis_interrupt1), enable);
         pio_set_irq1_source_enabled(video_pio, pis_sm0_tx_fifo_not_full + PICO_SCANVIDEO_TIMING_SM, enable);
-        irq_set_mask_enabled((1u << PIO0_IRQ_0)
-                              | (1u << PIO0_IRQ_1)
-                              #if !PICO_SCANVIDEO_NO_DMA_TRACKING
-                              | (1u << DMA_IRQ_0)
+        if (scanvideo_nvic_managed_by_timing) {
+            irq_set_mask_enabled((1u << PIO0_IRQ_0)
+                                | (1u << PIO0_IRQ_1)
+#if !PICO_SCANVIDEO_NO_DMA_TRACKING
+                                | (1u << DMA_IRQ_0)
 #endif
-                , enable);
+                    , enable);
+        }
 
         uint32_t sm_mask = (1u << PICO_SCANVIDEO_SCANLINE_SM) | 1u << PICO_SCANVIDEO_TIMING_SM;
 #if PICO_SCANVIDEO_PLANE_COUNT > 1
