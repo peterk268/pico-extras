@@ -1073,6 +1073,13 @@ void setup_sm(int sm, uint offset) {
         sm_config_set_out_shift(&config, true, true, 32);
         const uint BASE = PICO_SCANVIDEO_SYNC_PIN_BASE; // hsync and vsync are +0 and +1, clock is +2
         uint pin_count;
+#if PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+        // vsync, hsync, clock, den: 4 OUT pins with the sideset clock pin in the middle of them.
+        // sideset takes priority over OUT on the same pin, so the OUT clock bit is ignored
+        sm_config_set_out_pins(&config, BASE, 4);
+        sm_config_set_sideset_pins(&config, BASE + 2);
+        pin_count = 4;
+#else
 #if PICO_SCANVIDEO_ENABLE_DEN_PIN
         pin_count = 3;
         // 3 OUT pins and maybe 1 sideset pin following them
@@ -1085,6 +1092,7 @@ void setup_sm(int sm, uint offset) {
         // side set pin as well
         sm_config_set_sideset_pins(&config, BASE + pin_count);
         pin_count++;
+#endif
 #endif
         int status = pio_sm_set_consecutive_pindirs(video_pio, sm, BASE, pin_count, true);
         printf("\nSTATUS %d\n", status);
@@ -1402,6 +1410,15 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
 
     uint64_t pin_mask = 3ull << PICO_SCANVIDEO_SYNC_PIN_BASE;
 
+    #if PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+    bi_decl_if_func_used(bi_2pins_with_names(
+        PICO_SCANVIDEO_SYNC_PIN_BASE, "VSync",
+        PICO_SCANVIDEO_SYNC_PIN_BASE + 1, "HSync"));
+    bi_decl_if_func_used(bi_2pins_with_names(
+        PICO_SCANVIDEO_SYNC_PIN_BASE + 2, "Pixel Clock",
+        PICO_SCANVIDEO_SYNC_PIN_BASE + 3, "Display Enable"));
+    pin_mask |= 3ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+    #else
     bi_decl_if_func_used(bi_2pins_with_names(
         PICO_SCANVIDEO_SYNC_PIN_BASE, "HSync",
         PICO_SCANVIDEO_SYNC_PIN_BASE + 1, "VSync"));
@@ -1417,6 +1434,7 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
     #elif PICO_SCANVIDEO_ENABLE_CLOCK_PIN
     bi_decl_if_func_used(bi_1pin_with_name(PICO_SCANVIDEO_SYNC_PIN_BASE + 2, "Pixel Clock"));
     pin_mask |= 1ull << (PICO_SCANVIDEO_SYNC_PIN_BASE + 2);
+    #endif
     #endif
 
     static_assert(PICO_SCANVIDEO_PIXEL_RSHIFT + PICO_SCANVIDEO_PIXEL_RCOUNT <= PICO_SCANVIDEO_COLOR_PIN_COUNT, "red bits do not fit in color pins");
@@ -1514,6 +1532,12 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
 
     uint32_t side_set_xor = 0;
     modified_program = copy_program(&video_htiming_program, instructions, count_of(instructions));
+
+#if PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+    // 16 exec + 12 length + 4 pins (low 5 bits of OUT are the bit count)
+    instructions[video_htiming_offset_out_length] = (instructions[video_htiming_offset_out_length] & ~0x1fu) | 12u;
+    instructions[video_htiming_offset_out_sync_pins] = (instructions[video_htiming_offset_out_sync_pins] & ~0x1fu) | 4u;
+#endif
 
     if (timing->clock_polarity) {
         side_set_xor = 0x1000; // flip the top side set bit
@@ -1650,7 +1674,18 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
     timing_state.v_active = timing->v_active;
     timing_state.v_pulse_start = timing->v_active + timing->v_front_porch;
     timing_state.v_pulse_end = timing_state.v_pulse_start + timing->v_pulse;
-    const uint32_t vsync_bit = 0x40000000;
+#if PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+#define TIMING_PINS_SHIFT 28u
+#define SYNC_PIN_VSYNC 1
+#define SYNC_PIN_HSYNC 2
+#define SYNC_PIN_DEN 8
+#else
+#define TIMING_PINS_SHIFT 29u
+#define SYNC_PIN_HSYNC 1
+#define SYNC_PIN_VSYNC 2
+#define SYNC_PIN_DEN 4
+#endif
+    const uint32_t vsync_bit = (uint32_t)SYNC_PIN_VSYNC << TIMING_PINS_SHIFT;
     timing_state.vsync_bits_pulse = timing->v_sync_polarity ? 0 : vsync_bit;
     timing_state.vsync_bits_no_pulse = timing->v_sync_polarity ? vsync_bit : 0;
 
@@ -1660,7 +1695,7 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
 #define HTIMING_MIN 8
 
 #define TIMING_CYCLE 3u
-#define timing_encode(state, length, pins) ((video_htiming_states_program.instructions[state] ^ side_set_xor)| (((uint32_t)(length) - TIMING_CYCLE) << 16u) | ((uint32_t)(pins) << 29u))
+#define timing_encode(state, length, pins) ((video_htiming_states_program.instructions[state] ^ side_set_xor)| (((uint32_t)(length) - TIMING_CYCLE) << 16u) | ((uint32_t)(pins) << TIMING_PINS_SHIFT))
 #define A_CMD SET_IRQ_0
 #define A_CMD_VBLANK SET_IRQ_1
 #define B1_CMD CLEAR_IRQ_SCANLINE
@@ -1669,7 +1704,10 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
 #define C_CMD_VBLANK CLEAR_IRQ_SCANLINE
 
     // --- existing code before this computes h_back_porch etc. ---
-    int h_sync_bit = timing->h_sync_polarity ? 0 : 1;
+    int h_sync_bit = timing->h_sync_polarity ? 0 : SYNC_PIN_HSYNC;
+    int h_sync_idle = timing->h_sync_polarity ? SYNC_PIN_HSYNC : 0;
+    // every state is shorter than a line, so this bounds the length field (16 + length + pins = 32 bits)
+    valid_params_if(SCANVIDEO_DPI, timing->h_total - TIMING_CYCLE < (1u << (TIMING_PINS_SHIFT - 16u)));
 
     // A: small preamble (unchanged)
     timing_state.a       = timing_encode(A_CMD,            4,                          h_sync_bit);
@@ -1682,20 +1720,20 @@ bool scanvideo_setup_with_timing(const scanvideo_mode_t *mode, const scanvideo_t
     // B2: back porch (unchanged)
     int h_back_porch = timing->h_total - timing->h_front_porch - timing->h_pulse - timing->h_active;
     valid_params_if(SCANVIDEO_DPI, h_back_porch >= HTIMING_MIN);
-    timing_state.b2      = timing_encode(B2_CMD,           h_back_porch,               !h_sync_bit);
+    timing_state.b2      = timing_encode(B2_CMD,           h_back_porch,               h_sync_idle);
 
     // C: ACTIVE ONLY (DEN=1 here)
     valid_params_if(SCANVIDEO_DPI, timing->h_active >= HTIMING_MIN);
-    timing_state.c       = timing_encode(C_CMD,            timing->h_active,           (4 /*DEN*/ | !h_sync_bit));
+    timing_state.c       = timing_encode(C_CMD,            timing->h_active,           (SYNC_PIN_DEN | h_sync_idle));
 
     // D: FRONT PORCH (DEN=0 here) — NEW
     valid_params_if(SCANVIDEO_DPI, timing->h_front_porch >= HTIMING_MIN);
-    timing_state.d       = timing_encode(C_CMD,            timing->h_front_porch,      (!h_sync_bit));
+    timing_state.d       = timing_encode(C_CMD,            timing->h_front_porch,      h_sync_idle);
 
     // VBLANK variants: DEN must be low throughout
     // (Active=0 lines; we still provide the structure so the SM timing stays consistent)
-    timing_state.c_vblank= timing_encode(C_CMD_VBLANK,     timing->h_active,           (!h_sync_bit));
-    timing_state.d_vblank= timing_encode(C_CMD_VBLANK,     timing->h_front_porch,      (!h_sync_bit));
+    timing_state.c_vblank= timing_encode(C_CMD_VBLANK,     timing->h_active,           h_sync_idle);
+    timing_state.d_vblank= timing_encode(C_CMD_VBLANK,     timing->h_front_porch,      h_sync_idle);
 
     // this is two scanlines in vblank
     setup_dma_states_vblank();

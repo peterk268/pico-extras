@@ -13,8 +13,11 @@ public entry_point:
 new_state:
     out exec, 16    side 1 ; this does any per state inline work (or it can be a JMP to entry_point to sleep..
                           ; note the EXECed instruction should have a side set 0
-    out x, 13       side 1
-    out pins, 3     side 0 ; we want an OUT EXEC above which sets an IRQ to start scanline output
+public out_length:
+    out x, 13       side 1 ; patched to 12 bits for PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+public out_sync_pins:
+    out pins, 3     side 0 ; patched to 4 pins for PICO_SCANVIDEO_ALT_SYNC_PIN_ORDER
+                          ; we want an OUT EXEC above which sets an IRQ to start scanline output
                           ; to cause this out and the pixel out in the same cycle (this would be positive clk edge latch)
 loop:
     nop             side 1
